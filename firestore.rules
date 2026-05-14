@@ -1,0 +1,90 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helper Functions ───────────────────────────────────────
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    function isValidPoints(amount) {
+      return amount is int && amount >= 0;
+    }
+
+    // ─── Users ──────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isAuth();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId)
+        && (!request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['points', 'badge', 'totalSubmissions']));
+      // points, badge, totalSubmissions hanya boleh diubah Cloud Functions
+    }
+
+    // ─── Products ───────────────────────────────────────────────
+    match /products/{productId} {
+      allow read: if true; // public
+      allow create: if isAuth();
+      allow update: if isAuth()
+        && (!request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['submissionCount']));
+      // submissionCount hanya diubah Cloud Functions
+      allow delete: if false;
+    }
+
+    // ─── Price History ──────────────────────────────────────────
+    match /price_history/{productId}/entries/{entryId} {
+      allow read: if true; // public
+      allow create: if false; // hanya Cloud Functions
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ─── Community Submissions ───────────────────────────────────
+    match /community_submissions/{submissionId} {
+      allow read: if isAuth();
+      allow create: if isAuth()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.price is int
+        && request.resource.data.price > 0;
+      allow update: if isAuth()
+        && (
+          // User hanya boleh upvote (increment upvotes +1)
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['upvotes'])
+          ||
+          // Owner boleh edit jika masih pending
+          (isOwner(resource.data.userId)
+            && resource.data.status == 'pending'
+            && request.resource.data.status == 'pending')
+        );
+      allow delete: if isOwner(resource.data.userId)
+        && resource.data.status == 'pending';
+    }
+
+    // ─── Baskets ────────────────────────────────────────────────
+    match /baskets/{basketId} {
+      allow read, write: if isAuth()
+        && isOwner(resource.data.userId);
+      allow create: if isAuth()
+        && request.resource.data.userId == request.auth.uid;
+    }
+
+    // ─── Skins ──────────────────────────────────────────────────
+    match /skins/{skinId} {
+      allow read: if true; // public
+      allow write: if false; // hanya admin/seed script
+    }
+
+    // ─── Promo Cache ─────────────────────────────────────────────
+    match /promo_cache/{productId} {
+      allow read: if true; // public
+      allow write: if false; // hanya Cloud Functions
+    }
+  }
+}
