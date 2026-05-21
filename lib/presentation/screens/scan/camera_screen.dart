@@ -5,6 +5,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import '../../../data/services/gemini_service.dart';
 
 class CameraScreen extends ConsumerStatefulWidget {
   const CameraScreen({super.key});
@@ -64,11 +65,40 @@ class _CameraScreenState extends ConsumerState<CameraScreen> {
       if (!mounted) return;
 
       if (_selectedTab == 0) {
-        context.go('/result', extra: {'imageBytes': bytes, 'type': 'product'});
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) => const AlertDialog(
+            content: Row(
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(width: 16),
+                Text("Menganalisis produk..."),
+              ],
+            ),
+          ),
+        );
+
+        final geminiService = GeminiService();
+        final result = await geminiService.analyzeProduct(bytes);
+
+        if (!mounted) return;
+        Navigator.pop(context);
+
+        if (result != null) {
+          context.go('/result', extra: {'data': result, 'imageBytes': bytes, 'type': 'product'});
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Gagal menganalisis, coba lagi')),
+          );
+        }
       } else if (_selectedTab == 2) {
         context.go('/basket', extra: {'imageBytes': bytes});
       }
     } catch (e) {
+      if (mounted && Navigator.canPop(context)) {
+        Navigator.pop(context);
+      }
       debugPrint('Error capturing photo: \$e');
     } finally {
       if (mounted) {
@@ -135,7 +165,32 @@ class _CameraScreenState extends ConsumerState<CameraScreen> {
             );
           }
         } else if (_selectedTab == 0) {
-          context.go('/result', extra: {'imageBytes': bytes, 'type': 'product'});
+          showDialog(
+            context: context,
+            barrierDismissible: false,
+            builder: (context) => const AlertDialog(
+              content: Row(
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(width: 16),
+                  Text("Menganalisis produk..."),
+                ],
+              ),
+            ),
+          );
+
+          final result = await GeminiService().analyzeProduct(bytes);
+
+          if (!mounted) return;
+          Navigator.pop(context);
+
+          if (result != null) {
+            context.go('/result', extra: {'data': result, 'imageBytes': bytes, 'type': 'product'});
+          } else {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Gagal menganalisis, coba lagi')),
+            );
+          }
         } else if (_selectedTab == 2) {
           context.go('/basket', extra: {'imageBytes': bytes});
         }
@@ -151,6 +206,34 @@ class _CameraScreenState extends ConsumerState<CameraScreen> {
 
     return Scaffold(
       backgroundColor: Colors.black,
+      extendBodyBehindAppBar: true,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () {
+            if (Navigator.of(context).canPop()) {
+              Navigator.of(context).pop();
+            } else {
+              context.go('/home');
+            }
+          },
+        ),
+        title: const Text(
+          'Scan Produk',
+          style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.flash_on, color: Colors.white),
+            onPressed: () {
+              // Toggle flash
+            },
+          ),
+        ],
+      ),
       body: Stack(
         children: [
           // Full screen CameraPreview
@@ -162,32 +245,6 @@ class _CameraScreenState extends ConsumerState<CameraScreen> {
           // Overlay gelap semi-transparent
           Container(
             color: Colors.black54,
-          ),
-          
-          // Top bar
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.arrow_back, color: Colors.white),
-                    onPressed: () => context.pop(),
-                  ),
-                  const Text(
-                    'Scan Produk',
-                    style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.flash_on, color: Colors.white),
-                    onPressed: () {
-                      // Toggle flash
-                    },
-                  ),
-                ],
-              ),
-            ),
           ),
           
           // Center AnimatedContainer scan frame

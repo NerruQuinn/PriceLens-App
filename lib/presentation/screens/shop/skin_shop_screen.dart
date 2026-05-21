@@ -141,7 +141,7 @@ class _SkinShopScreenState extends ConsumerState<SkinShopScreen> {
       appBar: AppBar(
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
-          onPressed: () => context.pop(),
+          onPressed: () => context.go('/home'),
         ),
         title: const Text('Toko Skin'),
         centerTitle: true,

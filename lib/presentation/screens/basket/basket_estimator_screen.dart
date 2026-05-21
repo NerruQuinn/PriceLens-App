@@ -7,7 +7,7 @@ import 'package:intl/intl.dart';
 
 import '../../../data/models/basket_model.dart';
 import '../../../data/services/gemini_service.dart';
-import '../../../data/services/firestore_service.dart';
+
 import '../../../data/services/storage_service.dart';
 import '../../../providers/auth_provider.dart';
 import '../../../providers/user_provider.dart';
@@ -42,6 +42,7 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
 
   Future<void> _analyzeBasket(Uint8List imageBytes) async {
     if (!mounted) return;
+    debugPrint('[BasketEstimator] _analyzeBasket called with ${imageBytes.length} bytes');
     setState(() {
       _isAnalyzing = true;
       _basketImageBytes = imageBytes;
@@ -54,6 +55,7 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
       final storageService = StorageService();
       final user = ref.read(currentUserModelProvider).value;
 
+      debugPrint('[BasketEstimator] Calling analyzeBasket...');
       final result = await geminiService.analyzeBasket(imageBytes);
 
       if (result != null) {
@@ -75,7 +77,7 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
           // Assume BasketModel has a fromMap that can parse the items
           basket = BasketModel.fromMap(basketMap);
         } catch (e) {
-          debugPrint('BasketModel.fromMap error: \$e');
+          debugPrint('BasketModel.fromMap error: $e');
           rethrow;
         }
 
@@ -91,7 +93,7 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
           try {
             await (firestoreService as dynamic).saveBasket(basket);
           } catch (e) {
-            debugPrint('Failed to save basket to firestore: \$e');
+            debugPrint('Failed to save basket to firestore: $e');
           }
         }
 
@@ -109,7 +111,9 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
           });
         }
       }
-    } catch (e) {
+    } catch (e, stack) {
+      debugPrint('[BasketEstimator] Error: $e');
+      debugPrint('[BasketEstimator] Stack: $stack');
       if (mounted) {
         setState(() {
           _errorMessage = e.toString();
@@ -120,20 +124,32 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
   }
 
   Future<void> _captureBasket() async {
-    final picker = ImagePicker();
-    final photo = await picker.pickImage(source: ImageSource.camera);
-    if (photo != null) {
-      final bytes = await photo.readAsBytes();
-      _analyzeBasket(bytes);
+    debugPrint('[BasketEstimator] Camera button pressed');
+    try {
+      final picker = ImagePicker();
+      final photo = await picker.pickImage(source: ImageSource.camera);
+      debugPrint('[BasketEstimator] Camera image: ${photo?.path}');
+      if (photo != null) {
+        final bytes = await photo.readAsBytes();
+        _analyzeBasket(bytes);
+      }
+    } catch (e) {
+      debugPrint('[BasketEstimator] Camera capture error: $e');
     }
   }
 
   Future<void> _pickFromGallery() async {
-    final picker = ImagePicker();
-    final photo = await picker.pickImage(source: ImageSource.gallery);
-    if (photo != null) {
-      final bytes = await photo.readAsBytes();
-      _analyzeBasket(bytes);
+    debugPrint('[BasketEstimator] Gallery button pressed');
+    try {
+      final picker = ImagePicker();
+      final photo = await picker.pickImage(source: ImageSource.gallery);
+      debugPrint('[BasketEstimator] Image picked: ${photo?.path}');
+      if (photo != null) {
+        final bytes = await photo.readAsBytes();
+        _analyzeBasket(bytes);
+      }
+    } catch (e) {
+      debugPrint('[BasketEstimator] Gallery pick error: $e');
     }
   }
 
@@ -146,6 +162,24 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
 
   String formatCurrency(double amount) {
     return NumberFormat.currency(locale: 'id_ID', symbol: '', decimalDigits: 0).format(amount).trim();
+  }
+
+  String _normalizeConfidence(String? confidence) {
+    if (confidence == null || confidence.isEmpty) return 'medium';
+    final lower = confidence.toLowerCase();
+    if (lower == 'high' || lower == 'medium' || lower == 'low') {
+      return lower;
+    }
+    
+    final regex = RegExp(r'\d+');
+    final match = regex.firstMatch(confidence);
+    if (match != null) {
+      final value = int.tryParse(match.group(0) ?? '') ?? 0;
+      if (value >= 80) return 'high';
+      if (value >= 50) return 'medium';
+      return 'low';
+    }
+    return 'medium';
   }
 
   Color _getConfidenceColor(String? confidence) {
@@ -262,7 +296,7 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
     }
 
     // Result State
-    final itemsList = _basket!.items as List<dynamic>;
+    final itemsList = _basket!.items;
 
     return Scaffold(
       appBar: AppBar(
@@ -319,7 +353,7 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          '\${itemsList.length} item terdeteksi',
+                          '${itemsList.length} item terdeteksi',
                           style: const TextStyle(color: Colors.white),
                         ),
                         const Text(
@@ -327,7 +361,7 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
                           style: TextStyle(color: Colors.white70),
                         ),
                         Text(
-                          'Rp \${formatCurrency(_basket!.totalEstimate)}',
+                          'Rp ${formatCurrency(_basket!.totalEstimate)}',
                           style: textTheme.displaySmall?.copyWith(color: Colors.white, fontWeight: FontWeight.bold),
                         ),
                       ],
@@ -358,16 +392,14 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
                           children: [
                             Text('Potensi Hemat', style: textTheme.titleMedium?.copyWith(color: Colors.green, fontWeight: FontWeight.bold)),
                             Text(
-                              ((_basket as dynamic).savingsTip?.toString() ?? 'Beli di toko rekomendasi untuk harga terbaik'),
+                              _basket!.savingsTip.isNotEmpty ? _basket!.savingsTip : 'Beli di toko rekomendasi untuk harga terbaik',
                               style: textTheme.bodySmall?.copyWith(color: Colors.green.shade800),
                             ),
                           ],
                         ),
                       ),
                       Text(
-                        ((_basket as dynamic).savingsPotential != null) 
-                          ? 'Rp \${formatCurrency((_basket as dynamic).savingsPotential)}' 
-                          : 'Rp 0',
+                        'Rp ${formatCurrency(_basket!.savingsPotential)}',
                         style: textTheme.titleMedium?.copyWith(color: Colors.green, fontWeight: FontWeight.bold),
                       ),
                     ],
@@ -388,17 +420,25 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
             delegate: SliverChildBuilderDelegate(
               (context, index) {
                 final item = itemsList[index];
-                final itemName = (item as dynamic).name ?? 'Unknown Item';
-                final itemQuantity = (item as dynamic).quantity?.toString() ?? '1';
-                final itemCheapestStore = (item as dynamic).cheapestStore ?? 'Unknown Store';
-                final itemConfidence = (item as dynamic).confidence ?? 'high';
+                final itemName = item.name;
+                final itemQuantity = item.quantity.toString();
+                final itemCheapestStore = item.cheapestStore;
+                final itemConfidence = _normalizeConfidence(item.confidence);
+                final itemSubtotal = item.subtotal;
+                final itemUnitPrice = item.unitPriceEstimate;
 
                 return ListTile(
                   leading: CircleAvatar(child: Text(itemQuantity)),
                   title: Text(itemName, style: const TextStyle(fontWeight: FontWeight.bold)),
                   subtitle: Row(
                     children: [
-                      Text(itemCheapestStore, style: textTheme.bodySmall),
+                      Expanded(
+                        child: Text(
+                          itemCheapestStore,
+                          style: textTheme.bodySmall,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
                       const SizedBox(width: 8),
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
@@ -418,11 +458,11 @@ class _BasketEstimatorScreenState extends ConsumerState<BasketEstimatorScreen> {
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
                       Text(
-                        'Rp \${formatCurrency(itemSubtotal)}',
+                        'Rp ${formatCurrency(itemSubtotal)}',
                         style: textTheme.titleSmall?.copyWith(color: colorScheme.primary, fontWeight: FontWeight.bold),
                       ),
                       Text(
-                        '@ Rp \${formatCurrency(itemUnitPrice)}',
+                        '@ Rp ${formatCurrency(itemUnitPrice)}',
                         style: textTheme.bodySmall?.copyWith(color: Colors.grey),
                       ),
                     ],

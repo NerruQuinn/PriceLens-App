@@ -4,18 +4,20 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../../data/models/product_model.dart';
-import '../../../data/models/price_entry_model.dart';
+
 import '../../../data/services/gemini_service.dart';
-import '../../../data/services/firestore_service.dart';
-import '../../../providers/auth_provider.dart';
+import '../../../data/services/product_image_service.dart';
 import '../../../providers/user_provider.dart';
+import '../../../providers/auth_provider.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 class PriceResultScreen extends ConsumerStatefulWidget {
-  final Map<String, dynamic> extra;
+  final Map<String, dynamic>? extra;
 
-  const PriceResultScreen({super.key, required this.extra});
+  const PriceResultScreen({super.key, this.extra});
 
   @override
   ConsumerState<PriceResultScreen> createState() => _PriceResultScreenState();
@@ -28,17 +30,72 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
   Uint8List? imageBytes;
   String? barcode;
   String type = 'product';
+  String? _fetchedImageUrl;
 
   @override
   void initState() {
     super.initState();
-    imageBytes = widget.extra['imageBytes'] as Uint8List?;
-    barcode = widget.extra['barcode'] as String?;
-    type = widget.extra['type'] as String? ?? 'product';
+    
+    if (widget.extra == null) {
+      _isLoading = false;
+      _errorMessage = "Data tidak tersedia";
+      return;
+    }
+
+    imageBytes = widget.extra!['imageBytes'] as Uint8List?;
+    barcode = widget.extra!['barcode'] as String?;
+    type = widget.extra!['type'] as String? ?? 'product';
+    _resultData = widget.extra!['data'] as Map<String, dynamic>?;
     
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _analyzeProduct();
+      if (_resultData != null) {
+        setState(() {
+          _isLoading = false;
+        });
+        
+        final productName = _resultData!['product']?['name'] ?? '';
+        final barcodeStr = _resultData!['product']?['barcode']?.toString() ?? barcode;
+        ProductImageService.getProductImage(productName, barcode: barcodeStr).then((url) {
+          debugPrint('[ProductImageService] Got URL: $url');
+          if (mounted && url != null) {
+            setState(() => _fetchedImageUrl = url);
+          }
+        });
+
+        _saveToFirestore(_resultData!);
+      } else {
+        _analyzeProduct();
+      }
     });
+  }
+
+  Future<void> _launchURL(String storeName, String productName) async {
+    final query = Uri.encodeComponent('$productName $storeName harga Indonesia');
+    final urlString = 'https://www.google.com/search?q=$query';
+    debugPrint('[SourceLink] Opening: $urlString');
+    final uri = Uri.parse(urlString);
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      debugPrint('[SourceLink] Error: $e');
+    }
+  }
+
+  Future<void> _saveToFirestore(Map<String, dynamic> result) async {
+    try {
+      final firestoreService = ref.read(firestoreServiceProvider);
+      final product = ProductModel(
+        id: result['product']?['barcode']?.toString() ?? barcode ?? DateTime.now().millisecondsSinceEpoch.toString(),
+        name: result['product']?['name'] ?? 'Unknown Product',
+        brand: result['product']?['brand'] ?? 'Unknown Brand',
+        category: result['product']?['category'] ?? 'General',
+        imageUrl: result['image_url'],
+        lastUpdated: DateTime.now(),
+      );
+      await firestoreService.saveProduct(product);
+    } catch (e) {
+      debugPrint('Error saving to Firestore: \$e');
+    }
   }
 
   Future<void> _analyzeProduct() async {
@@ -50,7 +107,6 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
 
     try {
       final geminiService = GeminiService();
-      final firestoreService = ref.read(firestoreServiceProvider);
 
       Map<String, dynamic>? result;
       if (type == 'barcode' && barcode != null) {
@@ -65,17 +121,18 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
             _resultData = result;
           });
         }
+        
+        final productName = result['product']?['name'] ?? '';
+        final barcodeStr = result['product']?['barcode']?.toString() ?? barcode;
+        ProductImageService.getProductImage(productName, barcode: barcodeStr).then((url) {
+          debugPrint('[ProductImageService] Got URL: $url');
+          if (mounted && url != null) {
+            setState(() => _fetchedImageUrl = url);
+          }
+        });
 
         // Simpan ke Firestore via firestoreService jika result tidak null
-        final product = ProductModel(
-          id: result['id']?.toString() ?? barcode ?? DateTime.now().millisecondsSinceEpoch.toString(),
-          name: result['product_name'] ?? 'Unknown Product',
-          brand: result['brand'] ?? 'Unknown Brand',
-          category: result['category'] ?? 'General',
-          imageUrl: result['image_url'],
-          lastUpdated: DateTime.now(),
-        );
-        await firestoreService.saveProduct(product);
+        await _saveToFirestore(result);
       } else {
         if (mounted) {
           setState(() {
@@ -94,6 +151,58 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
         setState(() {
           _isLoading = false;
         });
+      }
+    }
+  }
+
+  Future<void> _saveToWishlist() async {
+    if (_resultData == null) return;
+    try {
+      final user = ref.read(currentUserModelProvider).value;
+      if (user == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Harap login terlebih dahulu')),
+        );
+        return;
+      }
+      
+      final productId = _resultData!['product']?['barcode']?.toString() ?? barcode ?? DateTime.now().millisecondsSinceEpoch.toString();
+      final lowestPrice = _resultData!['market_summary']?['lowest_price'] ?? 0;
+      
+      // Find store that has the lowest price
+      final prices = _resultData!['prices'] as List<dynamic>? ?? [];
+      String store = 'Toko';
+      if (prices.isNotEmpty) {
+        final lowestPriceItem = prices.firstWhere(
+          (p) => p['price'] == lowestPrice, 
+          orElse: () => prices.first
+        );
+        store = lowestPriceItem['store'] ?? 'Toko';
+      }
+
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.id)
+          .collection('wishlist')
+          .doc(productId)
+          .set({
+        'name': _resultData!['product']?['name'] ?? 'Unknown Product',
+        'brand': _resultData!['product']?['brand'] ?? 'Unknown Brand',
+        'lowest_price': lowestPrice,
+        'store': store,
+        'saved_at': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Berhasil disimpan ke wishlist')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Gagal menyimpan: $e')),
+        );
       }
     }
   }
@@ -160,11 +269,7 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
             actions: [
               IconButton(
                 icon: const Icon(Icons.bookmark_border),
-                onPressed: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Disimpan ke wishlist')),
-                  );
-                },
+                onPressed: _saveToWishlist,
               ),
             ],
           ),
@@ -177,15 +282,15 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    _resultData!['product_name'] ?? 'Unknown Product',
+                    _resultData!['product']?['name'] ?? 'Unknown Product',
                     style: textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 8),
                   Row(
                     children: [
-                      Chip(label: Text(_resultData!['brand'] ?? 'Brand')),
+                      Chip(label: Text(_resultData!['product']?['brand'] ?? 'Brand')),
                       const SizedBox(width: 8),
-                      Chip(label: Text(_resultData!['category'] ?? 'Category')),
+                      Chip(label: Text(_resultData!['product']?['category'] ?? 'Category')),
                     ],
                   ),
                   const Divider(height: 32),
@@ -226,6 +331,16 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
                             color: colorScheme.onPrimaryContainer,
                           ),
                         ),
+                        if (_resultData!['market_summary']?['recommendation'] != null) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            _resultData!['market_summary']['recommendation'].toString(),
+                            style: textTheme.bodySmall?.copyWith(
+                              color: colorScheme.onPrimaryContainer.withValues(alpha: 0.8),
+                              fontStyle: FontStyle.italic,
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -251,14 +366,14 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
               itemCount: prices.length,
               itemBuilder: (context, index) {
                 final priceItem = prices[index];
-                final storeName = priceItem['storeName'] ?? priceItem['store_name'] ?? 'Toko';
+                final storeName = priceItem['store'] ?? 'Toko';
                 final isOfficial = priceItem['is_official_store'] == true;
                 final priceDisplay = priceItem['price']?.toString() ?? '0';
-                final discount = priceItem['discount']?.toString();
+                final discount = priceItem['discount_percent']?.toString();
                 final typeChip = priceItem['type'] ?? 'online';
 
                 // Find if this is the lowest price
-                bool isLowest = index == 0; // Assuming it's sorted by Gemini or simple mock logic
+                bool isLowest = priceItem['price'] == _resultData!['market_summary']?['lowest_price'] || index == 0;
 
                 return Card(
                   shape: isOfficial
@@ -308,22 +423,37 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
                         ],
                       ],
                     ),
-                    trailing: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.end,
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text(
-                          'Rp $priceDisplay',
-                          style: TextStyle(
-                            color: isLowest ? Colors.green : colorScheme.primary,
-                            fontWeight: FontWeight.bold,
-                          ),
+                        Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Text(
+                              'Rp $priceDisplay',
+                              style: TextStyle(
+                                color: isLowest ? Colors.green : colorScheme.primary,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            if (discount != null && discount.isNotEmpty && discount != '0')
+                              Text(
+                                '-$discount%',
+                                style: const TextStyle(color: Colors.red, fontSize: 12),
+                              ),
+                          ],
                         ),
-                        if (discount != null && discount.isNotEmpty)
-                          Text(
-                            discount,
-                            style: const TextStyle(color: Colors.red, fontSize: 12),
-                          ),
+                        const SizedBox(width: 8),
+                        IconButton(
+                          icon: const Icon(Icons.open_in_new, size: 20),
+                          tooltip: 'Lihat Sumber',
+                          onPressed: () async {
+                            debugPrint('BUTTON TAPPED');
+                            final productName = _resultData!['product']?['name'] ?? '';
+                            await _launchURL(storeName, productName);
+                          },
+                        ),
                       ],
                     ),
                   ),
@@ -452,11 +582,7 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
         child: SizedBox(
           width: double.infinity,
           child: FilledButton(
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Disimpan ke wishlist')),
-              );
-            },
+            onPressed: _saveToWishlist,
             child: const Text('Simpan ke Wishlist'),
           ),
         ),
@@ -465,7 +591,7 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
   }
 
   Widget _buildHeaderImage() {
-    final imageUrl = _resultData?['image_url'];
+    final imageUrl = _fetchedImageUrl ?? _resultData?['image_url'];
     if (imageUrl != null && imageUrl.toString().startsWith('http')) {
       return CachedNetworkImage(
         imageUrl: imageUrl,

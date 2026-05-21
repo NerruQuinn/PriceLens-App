@@ -4,6 +4,8 @@ import 'package:go_router/go_router.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:intl/intl.dart';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import '../../../providers/auth_provider.dart';
 
 import '../../../providers/submission_provider.dart';
@@ -99,32 +101,57 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
-    final userAsync = ref.watch(currentUserModelProvider);
+    final currentUser = FirebaseAuth.instance.currentUser;
+    if (currentUser == null) {
+      return const Scaffold(body: Center(child: Text('Silakan login kembali')));
+    }
     
     return Scaffold(
-      body: userAsync.when(
-        data: (user) {
-          if (user == null) {
-            return const Center(child: Text('Silakan login kembali'));
+      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        stream: FirebaseFirestore.instance.collection('users').doc(currentUser.uid).snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return Center(child: Text('Error: ${snapshot.error}'));
           }
 
-          final badge = (user as dynamic).badge?.toString() ?? 'bronze';
+          final doc = snapshot.data;
+          if (doc != null && !doc.exists) {
+            FirebaseFirestore.instance.collection('users').doc(currentUser.uid).set({
+              'points': 0,
+              'badge': 'bronze',
+              'submissions_count': 0,
+              'total_upvotes': 0,
+              'unlocked_skins': ['default'],
+              'current_skin': 'default',
+              'displayName': currentUser.displayName ?? 'User',
+              'photoUrl': currentUser.photoURL,
+              'email': currentUser.email,
+              'createdAt': FieldValue.serverTimestamp(),
+            });
+          }
+
+          final data = doc?.data() ?? {};
+          final points = data['points'] as int? ?? 0;
+          final badge = data['badge']?.toString() ?? 'bronze';
+          final submissionsCount = data['submissions_count'] as int? ?? 0;
+          final totalUpvotes = data['total_upvotes'] as int? ?? 0;
+          
           final badgeColor = _getBadgeColor(badge);
-          final submissionsCount = (user as dynamic).submissionsCount as int? ?? 0;
-          final points = (user as dynamic).points as int? ?? 0;
-          
-          final approvedCount = (submissionsCount * 0.8).toInt(); // Mock 
-          final totalUpvotes = points ~/ 2; // Mock
-          
           final nextBadgeThreshold = _getNextBadgeThreshold(badge);
           final currentBadge = badge.toUpperCase();
           final nextBadge = _getNextBadgeName(badge).toUpperCase();
-          final progress = points / nextBadgeThreshold;
+          final progress = nextBadgeThreshold > 0 ? points / nextBadgeThreshold : 1.0;
           
-          final activeSkin = (user as dynamic).currentSkin?.toString() ?? 'default';
-          final unlockedSkins = (user as dynamic).unlockedSkins as List<dynamic>? ?? ['default'];
+          final activeSkin = data['current_skin']?.toString() ?? 'default';
+          final unlockedSkins = data['unlocked_skins'] as List<dynamic>? ?? ['default'];
+          
+          final displayName = data['displayName']?.toString() ?? currentUser.displayName ?? 'User';
+          final photoUrl = data['photoUrl']?.toString() ?? currentUser.photoURL;
 
-          final submissionsAsync = ref.watch(userSubmissionsProvider(user.id));
+          final submissionsAsync = ref.watch(userSubmissionsProvider(currentUser.uid));
 
           return CustomScrollView(
             slivers: [
@@ -157,10 +184,10 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                               CircleAvatar(
                                 radius: 50,
                                 backgroundColor: colorScheme.surface,
-                                backgroundImage: (user as dynamic).photoUrl != null
-                                    ? CachedNetworkImageProvider((user as dynamic).photoUrl!)
+                                backgroundImage: photoUrl != null
+                                    ? CachedNetworkImageProvider(photoUrl)
                                     : null,
-                                child: (user as dynamic).photoUrl == null
+                                child: photoUrl == null
                                     ? Icon(Icons.person, size: 50, color: colorScheme.primary)
                                     : null,
                               ),
@@ -177,7 +204,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                           ),
                           const SizedBox(height: 12),
                           Text(
-                            (user as dynamic).displayName ?? 'User',
+                            displayName,
                             style: textTheme.headlineSmall?.copyWith(color: Colors.white, fontWeight: FontWeight.bold),
                           ),
                           const SizedBox(height: 4),
@@ -195,7 +222,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                               const Icon(Icons.monetization_on, color: Colors.amber, size: 20),
                               const SizedBox(width: 4),
                               Text(
-                                '\$points Poin',
+                                '$points Poin',
                                 style: textTheme.titleLarge?.copyWith(color: Colors.white, fontWeight: FontWeight.bold),
                               ),
                             ],
@@ -214,7 +241,20 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                   child: Row(
                     children: [
                       _buildStatCard(submissionsCount.toString(), 'Submission', colorScheme, textTheme),
-                      _buildStatCard(approvedCount.toString(), 'Disetujui', colorScheme, textTheme),
+                      Expanded(
+                        child: FutureBuilder<AggregateQuerySnapshot>(
+                          future: FirebaseFirestore.instance
+                              .collection('community_submissions')
+                              .where('userId', isEqualTo: currentUser.uid)
+                              .where('status', isEqualTo: 'approved')
+                              .count()
+                              .get(),
+                          builder: (context, snap) {
+                            final approvedCount = snap.data?.count ?? 0;
+                            return _buildStatCardInner(approvedCount.toString(), 'Disetujui', colorScheme, textTheme);
+                          },
+                        ),
+                      ),
                       _buildStatCard(totalUpvotes.toString(), 'Upvotes', colorScheme, textTheme),
                     ],
                   ),
@@ -247,13 +287,22 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                           backgroundColor: Colors.grey.shade200,
                         ),
                         const SizedBox(height: 4),
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: Text(
-                            '\${nextBadgeThreshold - points} poin lagi',
-                            style: textTheme.bodySmall?.copyWith(color: Colors.grey),
+                        if (badge.toLowerCase() != 'legend')
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: Text(
+                              '${nextBadgeThreshold - points} poin lagi ke $nextBadge',
+                              style: textTheme.bodySmall?.copyWith(color: Colors.grey),
+                            ),
+                          )
+                        else
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: Text(
+                              'Level Max',
+                              style: textTheme.bodySmall?.copyWith(color: Colors.grey),
+                            ),
                           ),
-                        ),
                       ],
                     ),
                   ),
@@ -272,7 +321,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                           Text('Skin Aktif', style: textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold)),
                           const Spacer(),
                           TextButton(
-                            onPressed: () => context.go('/shop'),
+                            onPressed: () => context.push('/shop'),
                             child: const Text('Ganti'),
                           ),
                         ],
@@ -441,33 +490,35 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
             ],
           );
         },
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (error, stack) => Center(child: Text('Error: \$error')),
       ),
     );
   }
 
   Widget _buildStatCard(String value, String label, ColorScheme colorScheme, TextTheme textTheme) {
     return Expanded(
-      child: Card(
-        elevation: 0,
-        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.3),
-        shape: RoundedRectangleBorder(
-          side: BorderSide(color: colorScheme.outlineVariant),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 16.0),
-          child: Column(
-            children: [
-              Text(
-                value,
-                style: textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.bold, color: colorScheme.primary),
-              ),
-              const SizedBox(height: 4),
-              Text(label, style: textTheme.bodySmall?.copyWith(color: Colors.grey)),
-            ],
-          ),
+      child: _buildStatCardInner(value, label, colorScheme, textTheme),
+    );
+  }
+
+  Widget _buildStatCardInner(String value, String label, ColorScheme colorScheme, TextTheme textTheme) {
+    return Card(
+      elevation: 0,
+      color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.3),
+      shape: RoundedRectangleBorder(
+        side: BorderSide(color: colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16.0),
+        child: Column(
+          children: [
+            Text(
+              value,
+              style: textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.bold, color: colorScheme.primary),
+            ),
+            const SizedBox(height: 4),
+            Text(label, style: textTheme.bodySmall?.copyWith(color: Colors.grey)),
+          ],
         ),
       ),
     );

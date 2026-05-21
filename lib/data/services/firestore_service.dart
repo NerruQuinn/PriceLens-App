@@ -138,6 +138,29 @@ class FirestoreService {
     }
   }
 
+  Future<String> submitPrice(Map<String, dynamic> data) async {
+    try {
+      final docRef = await _db.collection('community_submissions').add({
+        'userId': data['userId'],
+        'product_id': data['product_id'],
+        'product_name': data['product_name'] ?? 'Unknown Product',
+        'price': data['price'],
+        'store_name': data['store_name'],
+        'city': data['city'],
+        'photo_url': data['photo_url'],
+        'status': data['status'] ?? 'pending',
+        'ai_validation_score': data['ai_validation_score'] ?? 0,
+        'upvotes': 0,
+        'upvoted_by': [],
+        'timestamp': FieldValue.serverTimestamp(),
+      });
+      return docRef.id;
+    } catch (e) {
+      debugPrint('Error submitPrice: \$e');
+      rethrow;
+    }
+  }
+
   Future<void> updateSubmissionStatus(String submissionId, String status, double aiScore, String reason) async {
     try {
       await _db.collection('submissions').doc(submissionId).update({

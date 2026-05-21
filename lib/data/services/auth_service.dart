@@ -12,7 +12,7 @@ class AuthService {
   User? get currentUser => _auth.currentUser;
   Stream<User?> get authStateChanges => _auth.authStateChanges();
 
-  Future<UserModel?> signInWithGoogle() async {
+  Future<UserCredential?> signInWithGoogle() async {
     try {
       final GoogleSignInAccount? googleUser = await _googleSignIn.signIn();
       if (googleUser == null) return null;
@@ -45,10 +45,8 @@ class AuthService {
           );
           
           await docRef.set(newUser.toMap());
-          return newUser;
-        } else {
-          return UserModel.fromMap(docSnap.data() as Map<String, dynamic>);
         }
+        return userCredential;
       }
     } catch (e) {
       debugPrint('Error signInWithGoogle: \$e');

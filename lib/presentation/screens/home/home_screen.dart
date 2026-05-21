@@ -3,7 +3,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../../providers/auth_provider.dart';
+import '../../../data/services/gemini_service.dart';
+import '../../../data/services/user_service.dart';
+import '../../../data/services/product_image_service.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 // ─── Currency formatter ───────────────────────────────────────────────────────
 final _rupiahFmt = NumberFormat.currency(
@@ -14,81 +20,18 @@ final _rupiahFmt = NumberFormat.currency(
 
 String _rp(double v) => _rupiahFmt.format(v);
 
-// ─── Dummy Data ───────────────────────────────────────────────────────────────
-const _promos = [
-  {
-    'name': 'Minyak Goreng Sunco 2L',
-    'store': 'Supermarket ABC',
-    'originalPrice': 54000.0,
-    'discountPrice': 32500.0,
-    'discount': '-40%',
-    'emoji': '🛢️',
-    'color': 0xFFFFF9C4,
-  },
-  {
-    'name': 'Beras Pandan Wangi 5Kg',
-    'store': 'Toko Makmur',
-    'originalPrice': 85000.0,
-    'discountPrice': 65000.0,
-    'discount': '-25%',
-    'emoji': '🌾',
-    'color': 0xFFE8F5E9,
-  },
-];
+Future<void> _launchProductSearch(String productName, String storeName) async {
+  final query = Uri.encodeComponent('$productName $storeName harga Indonesia');
+  final uri = Uri.parse('https://www.google.com/search?q=$query');
+  await launchUrl(uri, mode: LaunchMode.externalApplication);
+}
 
-const _popular = [
-  {
-    'name': 'Kopi Instan Gold 100g',
-    'price': 45000.0,
-    'isTrending': true,
-    'emoji': '☕',
-    'color': 0xFFD7CCC8,
-  },
-  {
-    'name': 'Sabun Cuci Piring Lemon 750ml',
-    'price': 15500.0,
-    'isTrending': true,
-    'emoji': '🧴',
-    'color': 0xFFF1F8E9,
-  },
-  {
-    'name': 'Tisu Toilet Premium 8 Roll',
-    'price': 38000.0,
-    'isTrending': false,
-    'emoji': '🧻',
-    'color': 0xFFCFD8DC,
-  },
-  {
-    'name': 'Susu UHT Full Cream 1L',
-    'price': 18900.0,
-    'isTrending': false,
-    'emoji': '🥛',
-    'color': 0xFFE3F2FD,
-  },
-];
-
-const _community = [
-  {
-    'user': 'Rina S.',
-    'initial': 'R',
-    'avatarColor': 0xFFE57373,
-    'image': 'https://i.pravatar.cc/150?u=rina',
-    'time': '2 jam yang lalu di Indomaret Sudirman',
-    'product': 'Indomie Goreng Special',
-    'price': 3100.0,
-    'upvotes': 24,
-  },
-  {
-    'user': 'Andi W.',
-    'initial': 'A',
-    'avatarColor': 0xFF81C784,
-    'image': null,
-    'time': '5 jam yang lalu di Alfamidi Kebon Jeruk',
-    'product': 'Aqua Botol 600ml',
-    'price': 3500.0,
-    'upvotes': 12,
-  },
-];
+String timeAgo(DateTime date) {
+  final diff = DateTime.now().difference(date);
+  if (diff.inMinutes < 60) return '${diff.inMinutes} menit lalu';
+  if (diff.inHours < 24) return '${diff.inHours} jam lalu';
+  return '${diff.inDays} hari lalu';
+}
 
 const _categories = [
   {'label': 'Makanan & Minuman', 'icon': Icons.restaurant},
@@ -109,6 +52,193 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   final Map<int, bool> _upvoted = {};
   bool _isExpanded = false;
   Timer? _collapseTimer;
+  final _userService = UserService();
+
+  bool _isLoadingData = true;
+  bool _hasError = false;
+  bool _isSearching = false;
+  List<Map<String, dynamic>> _promos = [];
+  List<Map<String, dynamic>> _popular = [];
+  List<Map<String, dynamic>> _community = [];
+  Map<String, String> _promoImages = {};
+  Map<String, String> _trendingImages = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHomeData();
+  }
+
+  Future<void> _loadHomeData() async {
+    setState(() {
+      _isLoadingData = true;
+      _hasError = false;
+    });
+
+    try {
+      final firestore = FirebaseFirestore.instance;
+      final docRef = firestore.collection('promo_cache').doc('daily_promos');
+
+      Map<String, dynamic>? data;
+
+      // Check Firestore cache first
+      final docSnap = await docRef.get();
+      if (docSnap.exists) {
+        final cached = docSnap.data()!;
+        final cachedAt = cached['cached_at'] as Timestamp?;
+        if (cachedAt != null &&
+            DateTime.now().difference(cachedAt.toDate()).inHours < 6) {
+          data = cached['data'] as Map<String, dynamic>?;
+        }
+      }
+
+      // Cache miss or expired — fetch from Gemini
+      if (data == null) {
+        data = await GeminiService().getPromoData();
+        if (data != null) {
+          await docRef.set({
+            'data': data,
+            'cached_at': FieldValue.serverTimestamp(),
+          });
+        }
+      }
+
+      // Fetch community submissions
+      List<Map<String, dynamic>> communityData = [];
+      try {
+        final querySnapshot = await firestore
+            .collection('community_submissions')
+            .where('status', isEqualTo: 'pending')
+            .orderBy('timestamp', descending: true)
+            .limit(5)
+            .get();
+        communityData = querySnapshot.docs.map((doc) => doc.data()).toList();
+      } catch (e) {
+        // Fallback if index is missing
+        try {
+          final fallbackSnapshot = await firestore
+              .collection('community_submissions')
+              .limit(10)
+              .get();
+          final docs = fallbackSnapshot.docs.map((doc) => doc.data()).toList();
+          docs.sort((a, b) {
+            final tA = a['timestamp'] as Timestamp?;
+            final tB = b['timestamp'] as Timestamp?;
+            if (tA == null || tB == null) return 0;
+            return tB.compareTo(tA);
+          });
+          communityData = docs;
+        } catch (_) {}
+      }
+
+      // Enrich community data with real display names
+      final List<Map<String, dynamic>> enrichedCommunity = [];
+      for (final x in communityData) {
+        final userId = x['userId'] as String? ?? '';
+        final name = userId.isNotEmpty
+            ? await _userService.getDisplayName(userId)
+            : 'Pengguna PriceLens';
+        final initial = name.length >= 2
+            ? name.substring(0, 2).toUpperCase()
+            : name.isNotEmpty ? name[0].toUpperCase() : 'PL';
+        final ts = x['timestamp'] as Timestamp?;
+        final timeStr = ts != null ? timeAgo(ts.toDate()) : 'Baru saja';
+        enrichedCommunity.add({
+          'user': name,
+          'initial': initial,
+          'avatarColor': 0xFF1976D2,
+          'time': timeStr,
+          'store': x['store_name'] ?? 'Toko',
+          'product': x['product_name'] ?? 'Produk',
+          'price': (x['price'] as num?)?.toDouble() ?? 0.0,
+          'upvotes': (x['upvotes'] as num?)?.toInt() ?? 0,
+        });
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _isLoadingData = false;
+        _community = enrichedCommunity;
+        if (data != null) {
+          if (data['promos'] != null) {
+            _promos = List<Map<String, dynamic>>.from(
+              (data['promos'] as List).map((x) => {
+                'name': x['name'] ?? '',
+                'store': x['store'] ?? '',
+                'originalPrice': (x['original_price'] as num?)?.toDouble() ?? 0.0,
+                'discountPrice': (x['discount_price'] as num?)?.toDouble() ?? 0.0,
+                'discount': x['discount_percent'] != null ? '-${x['discount_percent']}%' : '',
+                'color': 0xFFFFF9C4,
+              }),
+            );
+          }
+          if (data['trending'] != null) {
+            _popular = List<Map<String, dynamic>>.from(
+              (data['trending'] as List).map((x) => {
+                'name': x['name'] ?? '',
+                'price': (x['price'] as num?)?.toDouble() ?? 0.0,
+                'isTrending': true,
+                'color': 0xFFF1F8E9,
+              }),
+            );
+          }
+        } else {
+          _hasError = true;
+        }
+      });
+      _fetchImagesForProducts();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isLoadingData = false;
+        _hasError = true;
+      });
+    }
+  }
+
+  Future<void> _fetchImagesForProducts() async {
+    for (var promo in _promos) {
+      final name = promo['name']?.toString() ?? '';
+      if (name.isNotEmpty && !_promoImages.containsKey(name)) {
+        final url = await ProductImageService.getProductImage(name);
+        if (url != null && mounted) {
+          setState(() => _promoImages[name] = url);
+        }
+      }
+    }
+    for (var product in _popular) {
+      final name = product['name']?.toString() ?? '';
+      if (name.isNotEmpty && !_trendingImages.containsKey(name)) {
+        final url = await ProductImageService.getProductImage(name);
+        if (url != null && mounted) {
+          setState(() => _trendingImages[name] = url);
+        }
+      }
+    }
+  }
+
+  Future<void> _searchProduct(String query) async {
+    if (query.trim().isEmpty) return;
+    setState(() => _isSearching = true);
+    try {
+      final result = await GeminiService().analyzeProductFromBarcode(query.trim());
+      if (!mounted) return;
+      setState(() => _isSearching = false);
+      if (result != null) {
+        context.push('/result', extra: {'data': result, 'type': 'search', 'query': query.trim()});
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Produk tidak ditemukan, coba kata kunci lain')),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isSearching = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    }
+  }
 
   @override
   void dispose() {
@@ -130,30 +260,53 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       backgroundColor: const Color(0xFFFAFAFA),
       appBar: _buildAppBar(context, cs, tt),
       drawer: _buildDrawer(context, displayName, email, points),
-      body: SingleChildScrollView(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const SizedBox(height: 16),
-              _buildHeaderRow(tt, displayName, points),
-              const SizedBox(height: 20),
-              _buildSearchBar(context, cs),
-              const SizedBox(height: 24),
-              _buildCategorySection(cs, tt),
-              const SizedBox(height: 24),
-              _buildPromoSection(context, cs, tt),
-              const SizedBox(height: 24),
-              _buildPopularSection(cs, tt),
-              const SizedBox(height: 16),
-              _buildSubmitBanner(context),
-              const SizedBox(height: 16),
-              _buildCommunitySection(context, cs, tt),
-              const SizedBox(height: 100),
-            ],
+      body: Stack(
+        children: [
+          SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 16),
+                  _buildHeaderRow(tt, displayName, points),
+                  const SizedBox(height: 20),
+                  _buildSearchBar(context, cs),
+                  const SizedBox(height: 24),
+                  _buildCategorySection(cs, tt),
+                  const SizedBox(height: 24),
+                  _buildPromoSection(context, cs, tt),
+                  const SizedBox(height: 24),
+                  _buildPopularSection(cs, tt),
+                  const SizedBox(height: 16),
+                  _buildSubmitBanner(context),
+                  const SizedBox(height: 16),
+                  _buildCommunitySection(context, cs, tt),
+                  const SizedBox(height: 100),
+                ],
+              ),
+            ),
           ),
-        ),
+          if (_isSearching)
+            Container(
+              color: Colors.black54,
+              child: const Center(
+                child: Card(
+                  child: Padding(
+                    padding: EdgeInsets.all(24.0),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        CircularProgressIndicator(),
+                        SizedBox(width: 16),
+                        Text('Mencari produk...'),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
       floatingActionButton: FloatingActionButton.extended(
         backgroundColor: const Color(0xFF1976D2),
@@ -207,6 +360,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ),
       ),
       actions: [
+        IconButton(
+          icon: const Icon(Icons.refresh, color: Colors.black54),
+          onPressed: _isLoadingData ? null : _loadHomeData,
+        ),
         Badge(
           smallSize: 10,
           backgroundColor: Colors.redAccent,
@@ -229,7 +386,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Halo, $name 👋',
+              'Halo, $name',
               style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 4),
@@ -267,28 +424,38 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   // ── Search bar ────────────────────────────────────────────────────────────
   Widget _buildSearchBar(BuildContext context, ColorScheme cs) {
-    return GestureDetector(
-      onTap: () => context.go('/scan'),
-      child: Container(
-        height: 48,
-        decoration: BoxDecoration(
-          color: Colors.grey.shade100,
-          borderRadius: BorderRadius.circular(24),
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        child: Row(
-          children: [
-            const Icon(Icons.search, color: Colors.black54, size: 20),
-            const SizedBox(width: 12),
-            const Expanded(
-              child: Text(
-                'Cari produk atau scan...',
-                style: TextStyle(color: Colors.black54, fontSize: 14),
+    return Container(
+      height: 48,
+      decoration: BoxDecoration(
+        color: Colors.grey.shade100,
+        borderRadius: BorderRadius.circular(24),
+      ),
+      padding: const EdgeInsets.only(left: 16, right: 8),
+      child: Row(
+        children: [
+          const Icon(Icons.search, color: Colors.black54, size: 20),
+          const SizedBox(width: 12),
+          Expanded(
+            child: TextField(
+              decoration: const InputDecoration(
+                hintText: 'Cari produk atau scan...',
+                hintStyle: TextStyle(color: Colors.black54, fontSize: 14),
+                border: InputBorder.none,
+                isDense: true,
+                contentPadding: EdgeInsets.symmetric(vertical: 12),
               ),
+              textInputAction: TextInputAction.search,
+              onSubmitted: _searchProduct,
             ),
-            Icon(Icons.qr_code_scanner, color: const Color(0xFF1976D2), size: 20),
-          ],
-        ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.qr_code_scanner, color: Color(0xFF1976D2), size: 20),
+            onPressed: () => context.go('/scan'),
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(),
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
     );
   }
@@ -346,7 +513,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             Text(
-              'Promo Sekarang 🔥',
+              'Promo Sekarang',
               style: tt.titleSmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87),
             ),
             TextButton(
@@ -361,19 +528,45 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ],
         ),
         const SizedBox(height: 12),
-        SizedBox(
-          height: 240,
-          child: ListView.separated(
-            scrollDirection: Axis.horizontal,
-            clipBehavior: Clip.none,
-            itemCount: _promos.length,
-            separatorBuilder: (_, __) => const SizedBox(width: 12),
-            itemBuilder: (context, i) {
-              final p = _promos[i];
-              return _PromoCard(promo: p, cs: cs, tt: tt);
-            },
-          ),
-        ),
+        _isLoadingData
+            ? const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(32.0),
+                  child: CircularProgressIndicator(),
+                ),
+              )
+            : _hasError || _promos.isEmpty
+                ? GestureDetector(
+                    onTap: _hasError ? _loadHomeData : null,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 24),
+                      alignment: Alignment.center,
+                      child: Text(
+                        _hasError
+                            ? 'Tap refresh untuk memuat promo'
+                            : 'Tidak ada promo hari ini',
+                        style: TextStyle(color: Colors.black45, fontSize: 13),
+                      ),
+                    ),
+                  )
+                : SizedBox(
+                    height: 240,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      clipBehavior: Clip.none,
+                      itemCount: _promos.length,
+                      separatorBuilder: (_, __) => const SizedBox(width: 12),
+                      itemBuilder: (context, i) {
+                        final p = _promos[i];
+                        return _PromoCard(
+                          promo: p,
+                          cs: cs,
+                          tt: tt,
+                          imageUrl: _promoImages[p['name']?.toString() ?? ''],
+                        );
+                      },
+                    ),
+                  ),
       ],
     );
   }
@@ -388,21 +581,47 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           style: tt.titleSmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87),
         ),
         const SizedBox(height: 12),
-        GridView.builder(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 2,
-            childAspectRatio: 0.82,
-            crossAxisSpacing: 12,
-            mainAxisSpacing: 12,
-          ),
-          itemCount: _popular.length,
-          itemBuilder: (context, i) {
-            final p = _popular[i];
-            return _PopularCard(product: p, cs: cs, tt: tt);
-          },
-        ),
+        _isLoadingData
+            ? const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(32.0),
+                  child: CircularProgressIndicator(),
+                ),
+              )
+            : _hasError || _popular.isEmpty
+                ? GestureDetector(
+                    onTap: _hasError ? _loadHomeData : null,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 24),
+                      alignment: Alignment.center,
+                      child: Text(
+                        _hasError
+                            ? 'Tap refresh untuk memuat promo'
+                            : 'Belum ada data populer',
+                        style: TextStyle(color: Colors.black45, fontSize: 13),
+                      ),
+                    ),
+                  )
+                : GridView.builder(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 2,
+                      childAspectRatio: 0.82,
+                      crossAxisSpacing: 12,
+                      mainAxisSpacing: 12,
+                    ),
+                    itemCount: _popular.length,
+                    itemBuilder: (context, i) {
+                      final p = _popular[i];
+                      return _PopularCard(
+                        product: p,
+                        cs: cs,
+                        tt: tt,
+                        imageUrl: _trendingImages[p['name']?.toString() ?? ''],
+                      );
+                    },
+                  ),
       ],
     );
   }
@@ -412,109 +631,98 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          'Baru dari Komunitas',
-          style: tt.titleSmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              'Baru dari Komunitas',
+              style: tt.titleSmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87),
+            ),
+            TextButton(
+              onPressed: () => context.push('/community'),
+              style: TextButton.styleFrom(
+                minimumSize: Size.zero,
+                padding: EdgeInsets.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              child: const Text('Lihat Semua →', style: TextStyle(fontSize: 12, color: Color(0xFF1976D2))),
+            ),
+          ],
         ),
         const SizedBox(height: 12),
-        ListView.separated(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          itemCount: _community.length,
-          separatorBuilder: (_, __) => const SizedBox(height: 12),
-          itemBuilder: (context, i) {
-            final c = _community[i];
-            final upvoted = _upvoted[i] ?? false;
-            final upvotes = (c['upvotes'] as int) + (upvoted ? 1 : 0);
-            
-            return Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.grey.shade200),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      if (c['image'] != null)
+        _community.isEmpty && !_isLoadingData
+            ? const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Center(
+                  child: Text(
+                    'Belum ada submission dari komunitas.',
+                    style: TextStyle(color: Colors.black54, fontSize: 13),
+                  ),
+                ),
+              )
+            : ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: _community.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 12),
+                itemBuilder: (context, i) {
+                  final c = _community[i];
+                  final upvoted = _upvoted[i] ?? false;
+                  final upvotes = (c['upvotes'] as int) + (upvoted ? 1 : 0);
+                  
+                  return Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.grey.shade200),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
                         CircleAvatar(
-                          radius: 16,
-                          backgroundImage: NetworkImage(c['image'] as String),
-                        )
-                      else
-                        CircleAvatar(
-                          radius: 16,
+                          radius: 18,
                           backgroundColor: Color(c['avatarColor'] as int),
                           child: Text(
                             c['initial'] as String,
-                            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                            style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
                           ),
                         ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              c['user'] as String,
-                              style: tt.bodySmall?.copyWith(fontWeight: FontWeight.bold, color: Colors.black87),
-                            ),
-                            Text(
-                              c['time'] as String,
-                              style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFFAFAFA),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.grey.shade100),
-                    ),
-                    child: Row(
-                      children: [
+                        const SizedBox(width: 12),
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(
-                                c['product'] as String,
+                                '${c['user']} submit harga ${c['product']} di ${c['store']}',
                                 style: tt.bodySmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87),
                               ),
                               const SizedBox(height: 4),
                               Text(
-                                _rp(c['price'] as double),
-                                style: tt.bodyMedium?.copyWith(
-                                  color: const Color(0xFF1976D2),
-                                  fontWeight: FontWeight.bold,
-                                ),
+                                '${c['time']} • Harga: ${_rp(c['price'] as double)}',
+                                style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
                               ),
                             ],
                           ),
                         ),
+                        const SizedBox(width: 8),
                         GestureDetector(
                           onTap: () => setState(() => _upvoted[i] = !upvoted),
                           child: Column(
+                            mainAxisSize: MainAxisSize.min,
                             children: [
                               Icon(
                                 upvoted ? Icons.thumb_up : Icons.thumb_up_alt_outlined,
-                                size: 18,
+                                size: 20,
                                 color: upvoted ? const Color(0xFF1976D2) : Colors.black54,
                               ),
-                              const SizedBox(height: 2),
+                              const SizedBox(height: 4),
                               Text(
                                 '$upvotes',
                                 style: TextStyle(
                                   fontSize: 12,
                                   color: upvoted ? const Color(0xFF1976D2) : Colors.black54,
+                                  fontWeight: upvoted ? FontWeight.bold : FontWeight.normal,
                                 ),
                               ),
                             ],
@@ -522,12 +730,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         ),
                       ],
                     ),
-                  ),
-                ],
+                  );
+                },
               ),
-            );
-          },
-        ),
       ],
     );
   }
@@ -597,7 +802,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   label: 'Riwayat Pencarian',
                   onTap: () {
                     Navigator.pop(context);
-                    context.go('/explore');
+                    context.go('/history');
                   },
                 ),
                 _drawerItem(
@@ -742,103 +947,126 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
 // ─── Promo Card ───────────────────────────────────────────────────────────────
 class _PromoCard extends StatelessWidget {
-  const _PromoCard({required this.promo, required this.cs, required this.tt});
+  const _PromoCard({required this.promo, required this.cs, required this.tt, this.imageUrl});
 
   final Map<String, dynamic> promo;
   final ColorScheme cs;
   final TextTheme tt;
+  final String? imageUrl;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: 150,
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.grey.shade200),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Image area
-          Expanded(
-            flex: 5,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                Container(
-                  decoration: BoxDecoration(
-                    color: Color(promo['color'] as int),
-                    borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
-                  ),
-                  child: Center(
-                    child: Text(promo['emoji'] as String, style: const TextStyle(fontSize: 48)),
-                  ),
-                ),
-                Positioned(
-                  top: 8,
-                  left: 8,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+    final name = promo['name']?.toString() ?? '';
+    final store = promo['store']?.toString() ?? '';
+    final discount = promo['discount']?.toString() ?? '';
+    final discountPrice = (promo['discountPrice'] as num?)?.toDouble() ?? 0.0;
+    final originalPrice = (promo['originalPrice'] as num?)?.toDouble() ?? 0.0;
+    final color = Color((promo['color'] as num?)?.toInt() ?? 0xFFFFF9C4);
+    return GestureDetector(
+      onTap: () {
+        debugPrint('PROMO TAPPED: $name');
+        _launchProductSearch(name, store);
+      },
+      child: Container(
+        width: 150,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.grey.shade200),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              flex: 5,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Container(
                     decoration: BoxDecoration(
-                      color: const Color(0xFFD32F2F),
-                      borderRadius: BorderRadius.circular(4),
+                      color: color,
+                      borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
                     ),
-                    child: Text(
-                      promo['discount'] as String,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 10,
-                        fontWeight: FontWeight.bold,
+                    child: imageUrl != null
+                        ? ClipRRect(
+                            borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
+                            child: CachedNetworkImage(
+                              imageUrl: imageUrl!,
+                              fit: BoxFit.cover,
+                              errorWidget: (_, __, ___) => const Center(
+                                child: Icon(Icons.local_offer, size: 48, color: Colors.black26),
+                              ),
+                            ),
+                          )
+                        : const Center(
+                            child: Icon(Icons.local_offer, size: 48, color: Colors.black26),
+                          ),
+                  ),
+                  if (discount.isNotEmpty)
+                    Positioned(
+                      top: 8,
+                      left: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFD32F2F),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          discount,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                       ),
                     ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          // Info area
-          Expanded(
-            flex: 6,
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    promo['store'] as String,
-                    style: const TextStyle(fontSize: 10, color: Colors.black54),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    promo['name'] as String,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: tt.bodySmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87, height: 1.2),
-                  ),
-                  const Spacer(),
-                  Text(
-                    _rp(promo['discountPrice'] as double),
-                    style: tt.bodyMedium?.copyWith(
-                      color: const Color(0xFF1976D2),
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  Text(
-                    _rp(promo['originalPrice'] as double),
-                    style: const TextStyle(
-                      decoration: TextDecoration.lineThrough,
-                      color: Colors.black38,
-                      fontSize: 10,
-                    ),
-                  ),
                 ],
               ),
             ),
-          ),
-        ],
+            Expanded(
+              flex: 6,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      store,
+                      style: const TextStyle(fontSize: 10, color: Colors.black54),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      name,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: tt.bodySmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87, height: 1.2),
+                    ),
+                    const Spacer(),
+                    Text(
+                      _rp(discountPrice),
+                      style: tt.bodyMedium?.copyWith(
+                        color: const Color(0xFF1976D2),
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      _rp(originalPrice),
+                      style: const TextStyle(
+                        decoration: TextDecoration.lineThrough,
+                        color: Colors.black38,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -846,82 +1074,102 @@ class _PromoCard extends StatelessWidget {
 
 // ─── Popular Card ─────────────────────────────────────────────────────────────
 class _PopularCard extends StatelessWidget {
-  const _PopularCard({required this.product, required this.cs, required this.tt});
+  const _PopularCard({required this.product, required this.cs, required this.tt, this.imageUrl});
 
   final Map<String, dynamic> product;
   final ColorScheme cs;
   final TextTheme tt;
+  final String? imageUrl;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.grey.shade200),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            flex: 5,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                Container(
-                  decoration: BoxDecoration(
-                    color: Color(product['color'] as int),
-                    borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
-                  ),
-                  child: Center(
-                    child: Text(
-                      product['emoji'] as String,
-                      style: const TextStyle(fontSize: 48),
-                    ),
-                  ),
-                ),
-                if (product['isTrending'] as bool)
-                  Positioned(
-                    top: 8,
-                    right: 8,
-                    child: Container(
-                      padding: const EdgeInsets.all(4),
-                      decoration: const BoxDecoration(
-                        color: Color(0xFF8D6E63), // Brown
-                        shape: BoxShape.circle,
-                      ),
-                      child: const Icon(Icons.trending_up, color: Colors.white, size: 12),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          Expanded(
-            flex: 4,
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    final name = product['name']?.toString() ?? '';
+    final store = product['store']?.toString() ?? '';
+    final price = (product['price'] as num?)?.toDouble() ?? 0.0;
+    final color = Color((product['color'] as num?)?.toInt() ?? 0xFFF1F8E9);
+    final isTrending = product['isTrending'] as bool? ?? false;
+    return GestureDetector(
+      onTap: () {
+        debugPrint('RAK POPULER TAPPED: $name');
+        _launchProductSearch(name, store);
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.grey.shade200),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              flex: 5,
+              child: Stack(
+                fit: StackFit.expand,
                 children: [
-                  Text(
-                    product['name'] as String,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: tt.bodySmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87, height: 1.2),
-                  ),
-                  Text(
-                    _rp(product['price'] as double),
-                    style: tt.bodyMedium?.copyWith(
-                      color: const Color(0xFF1976D2),
-                      fontWeight: FontWeight.bold,
+                  Container(
+                    decoration: BoxDecoration(
+                      color: color,
+                      borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
                     ),
+                    child: imageUrl != null
+                        ? ClipRRect(
+                            borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
+                            child: CachedNetworkImage(
+                              imageUrl: imageUrl!,
+                              fit: BoxFit.cover,
+                              errorWidget: (_, __, ___) => const Center(
+                                child: Icon(Icons.shopping_bag, size: 48, color: Colors.black26),
+                              ),
+                            ),
+                          )
+                        : const Center(
+                            child: Icon(Icons.shopping_bag, size: 48, color: Colors.black26),
+                          ),
                   ),
+                  if (isTrending)
+                    Positioned(
+                      top: 8,
+                      right: 8,
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: const BoxDecoration(
+                          color: Color(0xFF8D6E63),
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(Icons.trending_up, color: Colors.white, size: 12),
+                      ),
+                    ),
                 ],
               ),
             ),
-          ),
-        ],
+            Expanded(
+              flex: 4,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      name,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: tt.bodySmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87, height: 1.2),
+                    ),
+                    Text(
+                      _rp(price),
+                      style: tt.bodyMedium?.copyWith(
+                        color: const Color(0xFF1976D2),
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

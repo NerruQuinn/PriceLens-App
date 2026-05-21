@@ -1,14 +1,11 @@
-import 'dart:typed_data';
+import 'dart:io';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
-
-import '../../../data/models/submission_model.dart';
-import '../../../data/models/price_entry_model.dart';
 import '../../../data/services/gemini_service.dart';
-import '../../../data/services/firestore_service.dart';
 import '../../../data/services/storage_service.dart';
 import '../../../providers/auth_provider.dart';
 import '../../../providers/user_provider.dart';
@@ -24,11 +21,12 @@ class PriceSubmissionScreen extends ConsumerStatefulWidget {
 
 class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
   final _formKey = GlobalKey<FormState>();
+  final TextEditingController _productNameController = TextEditingController();
   final TextEditingController _priceController = TextEditingController();
   final TextEditingController _storeController = TextEditingController();
   String? _selectedCity;
   DateTime _selectedDate = DateTime.now();
-  Uint8List? _receiptImageBytes;
+  File? _receiptImageFile;
   bool _isSubmitting = false;
   Map<String, dynamic>? _productData;
   int _estimatedPoints = 10;
@@ -44,10 +42,12 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
   void initState() {
     super.initState();
     _productData = widget.extra;
+    _productNameController.text = _productData?['product_name'] ?? _productData?['name'] ?? '';
   }
 
   @override
   void dispose() {
+    _productNameController.dispose();
     _priceController.dispose();
     _storeController.dispose();
     super.dispose();
@@ -55,7 +55,7 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
 
   void _calculatePoints() {
     int total = 10;
-    if (_receiptImageBytes != null) {
+    if (_receiptImageFile != null) {
       total += 5;
     }
     setState(() {
@@ -65,14 +65,10 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
 
   Future<void> _pickReceiptPhoto() async {
     final picker = ImagePicker();
-    // Biarkan user memilih camera atau galeri via dialog sederhana (opsional), 
-    // disini kita gunakan camera langsung untuk kecepatan, atau tampilkan dialog.
-    // Sesuai prompt: ImageSource.gallery atau camera. Kita pakai gallery.
     final photo = await picker.pickImage(source: ImageSource.gallery);
     if (photo != null) {
-      final bytes = await photo.readAsBytes();
       setState(() {
-        _receiptImageBytes = bytes;
+        _receiptImageFile = File(photo.path);
       });
       _calculatePoints();
     }
@@ -80,6 +76,13 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
 
   Future<void> _submitPrice() async {
     if (!_formKey.currentState!.validate()) return;
+    
+    if (_selectedCity == null || _selectedCity!.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Pilih kota terlebih dahulu'), backgroundColor: Colors.red),
+      );
+      return;
+    }
 
     setState(() {
       _isSubmitting = true;
@@ -87,66 +90,102 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
 
     try {
       final user = ref.read(currentUserModelProvider).value;
-      if (user == null) throw Exception('User not logged in');
+      if (user == null) throw Exception('User belum login. Silakan login terlebih dahulu.');
 
       final firestoreService = ref.read(firestoreServiceProvider);
       final storageService = StorageService();
       final geminiService = GeminiService();
 
-      String? photoUrl;
-      if (_receiptImageBytes != null) {
-        photoUrl = await storageService.uploadReceiptPhoto(_receiptImageBytes!, user.id);
-      }
-
       final priceValue = double.tryParse(_priceController.text.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0.0;
       final productId = _productData?['id']?.toString() ?? 'unknown_product_id';
-      final productName = _productData?['product_name'] ?? _productData?['name'] ?? 'Unknown Product';
+      final productName = _productNameController.text;
       final storeName = _storeController.text;
 
-      final submissionId = DateTime.now().millisecondsSinceEpoch.toString() + user.id.substring(0, 3);
-      
-      final submission = SubmissionModel(
-        id: submissionId,
-        userId: user.id,
-        productId: productId,
-        price: priceValue,
-        storeName: storeName,
-        city: _selectedCity ?? 'Unknown',
-        photoUrl: photoUrl,
-        status: 'pending',
-        aiValidationScore: 0.0,
-        upvotes: 0,
-        upvotedBy: const [],
-        timestamp: DateTime.now(),
-      );
-
-      // Call firestoreService.createSubmission()
-      await (firestoreService as dynamic).createSubmission(submission);
-
-      // Award points via firestoreService.addPoints()
-      await firestoreService.addPoints(user.id, _estimatedPoints);
-
-      // Call geminiService.validateSubmission() di background
-      _runBackgroundValidation(
-        geminiService: geminiService,
-        firestoreService: firestoreService,
-        submission: submission,
-        productName: productName,
-      );
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Berhasil disubmit! Kamu mendapat +$_estimatedPoints Poin'),
-            backgroundColor: Colors.green,
-          ),
+      Map<String, dynamic>? validationResult;
+      try {
+        validationResult = await geminiService.validateSubmission(
+          productName: productName,
+          submittedPrice: priceValue,
+          storeName: storeName,
+          receiptImage: _receiptImageFile,
         );
-        context.go('/home');
+      } catch (e) {
+        debugPrint('Gemini validation failed or timeout: $e');
+        validationResult = null; // Proceed to fallback
       }
+
+      bool isValid = false;
+      int pointsAwarded = _estimatedPoints;
+      double aiScore = 0.5;
+      String status = 'pending';
+
+      if (validationResult != null) {
+        final validation = validationResult['validation'] as Map<String, dynamic>?;
+        isValid = validation?['status'] == 'valid' || validation?['status'] == 'approved' || validation?['status'] == true || validationResult['is_valid'] == true;
+        pointsAwarded = validationResult['points_awarded'] ?? _estimatedPoints;
+        aiScore = validationResult['confidence_score'] ?? 1.0;
+        status = isValid ? 'approved' : 'rejected';
+      } else {
+        isValid = true; // Fallback so we don't reject
+      }
+
+      if (isValid) {
+        String submissionId = await (firestoreService as dynamic).submitPrice({
+          'userId': user.id,
+          'product_id': productId,
+          'product_name': productName,
+          'price': priceValue,
+          'store_name': storeName,
+          'city': _selectedCity ?? 'Unknown',
+          'photo_url': null,
+          'status': status,
+          'ai_validation_score': aiScore,
+        });
+
+          if (_receiptImageFile != null) {
+            String? photoUrl = await storageService.uploadReceiptPhoto(_receiptImageFile!, submissionId);
+            if (photoUrl != null) {
+               // Update foto url if upload is successful
+               // For simplicity, update directly or via a service method
+               await FirebaseFirestore.instance.collection('community_submissions').doc(submissionId).update({
+                 'photo_url': photoUrl,
+               });
+            }
+          }
+
+          await firestoreService.addPoints(user.id, (pointsAwarded as num).toInt());
+
+          if (mounted) {
+            showDialog(
+              context: context,
+              barrierDismissible: false,
+              builder: (ctx) => AlertDialog(
+                title: const Text('Sukses!'),
+                content: Text('Harga berhasil disubmit. Kamu mendapat +$pointsAwarded Poin!'),
+                actions: [
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      context.go('/home');
+                    },
+                    child: const Text('OK'),
+                  ),
+                ],
+              ),
+            );
+          }
+        } else {
+           if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text("Submission ditolak: ${validationResult?['reason'] ?? 'Harga tidak valid'}"), backgroundColor: Colors.red),
+            );
+          }
+        }
     } catch (e) {
+      debugPrint('Error during submission: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Gagal submit: \$e'), backgroundColor: Colors.red),
+          SnackBar(content: Text('Gagal submit: $e'), backgroundColor: Colors.red),
         );
       }
     } finally {
@@ -158,66 +197,26 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
     }
   }
 
-  void _runBackgroundValidation({
-    required GeminiService geminiService,
-    required dynamic firestoreService,
-    required SubmissionModel submission,
-    required String productName,
-  }) async {
-    try {
-      final validationResult = await geminiService.validateSubmission(
-        productName: productName,
-        submittedPrice: submission.price,
-        storeName: submission.storeName,
-        receiptImage: _receiptImageBytes,
-      );
-
-      if (validationResult != null) {
-        final isValid = validationResult['is_valid'] == true;
-        final score = (validationResult['confidence_score'] ?? 0).toDouble();
-
-        final updatedSubmission = submission.copyWith(
-          status: isValid ? 'approved' : 'rejected',
-          aiValidationScore: score,
-        );
-
-        await firestoreService.updateSubmission(updatedSubmission);
-        
-        if (isValid) {
-          final priceEntry = PriceEntryModel(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
-            productId: submission.productId,
-            price: submission.price,
-            storeName: submission.storeName,
-            city: submission.city,
-            source: 'community',
-            photoUrl: submission.photoUrl,
-            submittedBy: submission.userId,
-            validationStatus: 'approved',
-            upvotes: 0,
-            timestamp: DateTime.now(),
-          );
-          await firestoreService.addPriceEntry(submission.productId, priceEntry);
-        }
-      }
-    } catch (e) {
-      debugPrint('Background validation error: \$e');
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
-    final String productName = _productData?['product_name'] ?? _productData?['name'] ?? 'Pilih Produk';
-    final String brandStr = _productData?['brand'] ?? 'Unknown Brand';
-    final String categoryStr = _productData?['category'] ?? 'Category';
     final String? imageUrl = _productData?['image_url'];
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Submit Harga Real'),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () {
+            if (context.canPop()) {
+              context.pop();
+            } else {
+              context.go('/home');
+            }
+          },
+        ),
         actions: [
           Padding(
             padding: const EdgeInsets.only(right: 16.0),
@@ -225,7 +224,7 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
               backgroundColor: Colors.green.shade50,
               avatar: const Icon(Icons.monetization_on, color: Colors.amber, size: 18),
               label: Text(
-                '+\$_estimatedPoints Poin',
+                '+$_estimatedPoints Poin',
                 style: const TextStyle(color: Colors.green, fontWeight: FontWeight.bold),
               ),
               side: BorderSide.none,
@@ -241,36 +240,23 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               // a) PRODUCT SECTION
-              Card(
-                elevation: 0,
-                color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.3),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  side: BorderSide(color: colorScheme.outlineVariant),
+              Text('Nama Produk', style: textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              if (imageUrl != null) ...[
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.network(imageUrl, width: 48, height: 48, fit: BoxFit.cover),
                 ),
-                child: ListTile(
-                  leading: imageUrl != null
-                      ? ClipRRect(
-                          borderRadius: BorderRadius.circular(8),
-                          child: Image.network(imageUrl, width: 48, height: 48, fit: BoxFit.cover),
-                        )
-                      : Container(
-                          width: 48, height: 48,
-                          decoration: BoxDecoration(
-                            color: colorScheme.primaryContainer,
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: Icon(Icons.shopping_bag, color: colorScheme.onPrimaryContainer),
-                        ),
-                  title: Text(productName, style: const TextStyle(fontWeight: FontWeight.bold)),
-                  subtitle: Text('$brandStr • $categoryStr'),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.edit),
-                    onPressed: () {
-                      // Logic untuk ganti produk
-                    },
-                  ),
+                const SizedBox(height: 8),
+              ],
+              TextFormField(
+                controller: _productNameController,
+                decoration: InputDecoration(
+                  prefixIcon: const Icon(Icons.shopping_bag),
+                  hintText: "Masukkan nama produk",
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                 ),
+                validator: (v) => (v == null || v.isEmpty) ? "Masukkan nama produk" : null,
               ),
               const SizedBox(height: 24),
 
@@ -319,7 +305,7 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
               Text('Kota/Kabupaten', style: textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
               const SizedBox(height: 8),
               DropdownButtonFormField<String>(
-                value: _selectedCity,
+                initialValue: _selectedCity,
                 items: _cities.map((city) => DropdownMenuItem(
                   value: city,
                   child: Text(city),
@@ -389,13 +375,13 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
                     border: Border.all(color: Colors.grey.shade400, width: 1.5), // Optional: wrap with dotted_border package if added later
                     borderRadius: BorderRadius.circular(16),
                   ),
-                  child: _receiptImageBytes != null
+                  child: _receiptImageFile != null
                       ? Stack(
                           fit: StackFit.expand,
                           children: [
                             ClipRRect(
                               borderRadius: BorderRadius.circular(15),
-                              child: Image.memory(_receiptImageBytes!, fit: BoxFit.cover),
+                              child: Image.file(_receiptImageFile!, fit: BoxFit.cover),
                             ),
                             Positioned(
                               top: 8,
@@ -406,7 +392,7 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
                                   icon: const Icon(Icons.close, color: Colors.white, size: 18),
                                   onPressed: () {
                                     setState(() {
-                                      _receiptImageBytes = null;
+                                      _receiptImageFile = null;
                                     });
                                     _calculatePoints();
                                   },
@@ -444,7 +430,7 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
                         children: [
                           Text('Estimasi Poin Kamu', style: textTheme.titleMedium),
                           Text(
-                            '\$_estimatedPoints poin',
+                            '$_estimatedPoints poin',
                             style: textTheme.headlineMedium?.copyWith(
                               fontWeight: FontWeight.bold,
                               color: colorScheme.primary,
@@ -457,7 +443,7 @@ class _PriceSubmissionScreenState extends ConsumerState<PriceSubmissionScreen> {
                         crossAxisAlignment: CrossAxisAlignment.end,
                         children: [
                           const Text('10 base poin'),
-                          if (_receiptImageBytes != null)
+                          if (_receiptImageFile != null)
                             const Text('+5 foto bonus', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
                         ],
                       ),

@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:dynamic_color/dynamic_color.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:intl/date_symbol_data_local.dart';
 
 import 'firebase_options.dart';
 import 'core/theme/app_theme.dart';
@@ -18,15 +19,26 @@ import 'presentation/screens/submit/price_submission_screen.dart';
 import 'presentation/screens/profile/profile_screen.dart';
 import 'presentation/screens/shop/skin_shop_screen.dart';
 import 'presentation/screens/explore/explore_screen.dart';
+import 'presentation/screens/history/search_history_screen.dart';
+import 'presentation/screens/community/community_screen.dart';
 
 import 'providers/auth_provider.dart';
+import 'data/services/skin_seed_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await initializeDateFormatting('id_ID', null);
   await dotenv.load(fileName: '.env');
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
+  
+  try {
+    await SkinSeedService.forceSeedSkins();
+  } catch (e) {
+    debugPrint('Error initializing skins: $e');
+  }
+  
   runApp(const ProviderScope(child: MyApp()));
 }
 
@@ -109,10 +121,10 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (context, state) => const CameraScreen(),
       ),
       GoRoute(
-        path: '/result/:productId',
+        path: '/result',
         builder: (context, state) {
-          final productId = state.pathParameters['productId']!;
-          return PriceResultScreen(extra: {'id': productId});
+          final extra = state.extra as Map<String, dynamic>?;
+          return PriceResultScreen(extra: extra);
         },
       ),
       GoRoute(
@@ -125,6 +137,14 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: '/shop',
         builder: (context, state) => const SkinShopScreen(),
+      ),
+      GoRoute(
+        path: '/history',
+        builder: (context, state) => const SearchHistoryScreen(),
+      ),
+      GoRoute(
+        path: '/community',
+        builder: (context, state) => const CommunityScreen(),
       ),
     ],
   );

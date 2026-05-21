@@ -1,3 +1,16 @@
+double _parsePrice(dynamic value) {
+  if (value == null) return 0;
+  if (value is num) return value.toDouble();
+  if (value is String) {
+    String cleaned = value.replaceAll(RegExp(r'[^0-9.]'), '');
+    return double.tryParse(cleaned) ?? 0;
+  }
+  if (value is Map) {
+    return _parsePrice(value['value'] ?? value['amount'] ?? value['price'] ?? 0);
+  }
+  return 0;
+}
+
 class BasketModel {
   final String id;
   final String userId;
@@ -5,6 +18,8 @@ class BasketModel {
   final double totalEstimate;
   final String? photoUrl;
   final DateTime createdAt;
+  final double savingsPotential;
+  final String savingsTip;
 
   BasketModel({
     required this.id,
@@ -13,6 +28,8 @@ class BasketModel {
     required this.totalEstimate,
     this.photoUrl,
     required this.createdAt,
+    this.savingsPotential = 0.0,
+    this.savingsTip = '',
   });
 
   BasketModel copyWith({
@@ -22,6 +39,8 @@ class BasketModel {
     double? totalEstimate,
     String? photoUrl,
     DateTime? createdAt,
+    double? savingsPotential,
+    String? savingsTip,
   }) {
     return BasketModel(
       id: id ?? this.id,
@@ -30,6 +49,8 @@ class BasketModel {
       totalEstimate: totalEstimate ?? this.totalEstimate,
       photoUrl: photoUrl ?? this.photoUrl,
       createdAt: createdAt ?? this.createdAt,
+      savingsPotential: savingsPotential ?? this.savingsPotential,
+      savingsTip: savingsTip ?? this.savingsTip,
     );
   }
 
@@ -41,10 +62,21 @@ class BasketModel {
       'totalEstimate': totalEstimate,
       'photoUrl': photoUrl,
       'createdAt': createdAt.toIso8601String(),
+      'savingsPotential': savingsPotential,
+      'savingsTip': savingsTip,
     };
   }
 
   factory BasketModel.fromMap(Map<String, dynamic> map) {
+    double totalEstimate = map.containsKey('totalEstimate') 
+        ? _parsePrice(map['totalEstimate'])
+        : _parsePrice((map['summary'] as Map?)?['total_estimate']);
+        
+    if (totalEstimate == 0.0) {
+      final items = map['items'] as List? ?? [];
+      totalEstimate = items.fold(0.0, (sum, item) => sum + _parsePrice(item is Map ? item['subtotal'] : null));
+    }
+
     return BasketModel(
       id: map['id'] as String,
       userId: map['userId'] as String,
@@ -52,9 +84,13 @@ class BasketModel {
               ?.map((item) => BasketItemModel.fromMap(item as Map<String, dynamic>))
               .toList() ??
           [],
-      totalEstimate: (map['totalEstimate'] as num).toDouble(),
+      totalEstimate: totalEstimate,
       photoUrl: map['photoUrl'] as String?,
-      createdAt: DateTime.parse(map['createdAt'] as String),
+      createdAt: DateTime.parse(map['createdAt'] as String? ?? DateTime.now().toIso8601String()),
+      savingsPotential: map.containsKey('savingsPotential')
+          ? _parsePrice(map['savingsPotential'])
+          : _parsePrice((map['summary'] as Map?)?['potential_savings']),
+      savingsTip: map['savingsTip'] as String? ?? ((map['summary'] as Map?)?['savings_tip'] as String?) ?? '',
     );
   }
 }
@@ -112,13 +148,15 @@ class BasketItemModel {
 
   factory BasketItemModel.fromMap(Map<String, dynamic> map) {
     return BasketItemModel(
-      name: map['name'] as String,
+      name: map['name'] as String? ?? 'Unknown Item',
       brand: map['brand'] as String?,
-      quantity: map['quantity'] as int,
-      unitPriceEstimate: (map['unitPriceEstimate'] as num).toDouble(),
-      subtotal: (map['subtotal'] as num).toDouble(),
-      confidence: map['confidence'] as String,
-      cheapestStore: map['cheapestStore'] as String,
+      quantity: (map['quantity'] as num?)?.toInt() ?? 1,
+      unitPriceEstimate: map.containsKey('unit_price_estimate') 
+          ? _parsePrice(map['unit_price_estimate'])
+          : _parsePrice(map['unitPriceEstimate']),
+      subtotal: _parsePrice(map['subtotal']),
+      confidence: map['confidence']?.toString() ?? 'medium',
+      cheapestStore: map['cheapest_store']?.toString() ?? map['cheapestStore']?.toString() ?? '',
     );
   }
 }
