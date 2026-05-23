@@ -193,12 +193,7 @@ class _ExploreScreenState extends ConsumerState<ExploreScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        leading: Builder(
-          builder: (context) => IconButton(
-            icon: const Icon(Icons.menu),
-            onPressed: () => Scaffold.of(context).openDrawer(),
-          ),
-        ),
+
         title: Text(
           'Eksplor',
           style: textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
@@ -211,7 +206,7 @@ class _ExploreScreenState extends ConsumerState<ExploreScreen> {
           ),
         ],
       ),
-      drawer: const Drawer(),
+
       body: SafeArea(
         child: RefreshIndicator(
           onRefresh: _onRefresh,

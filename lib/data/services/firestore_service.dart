@@ -44,7 +44,7 @@ class FirestoreService {
   Future<void> unlockSkin(String userId, String skinId) async {
     try {
       await _db.collection('users').doc(userId).update({
-        'unlockedSkins': FieldValue.arrayUnion([skinId])
+        'unlocked_skins': FieldValue.arrayUnion([skinId])
       });
     } catch (e) {
       debugPrint('Error unlockSkin: \$e');
@@ -54,7 +54,7 @@ class FirestoreService {
   Future<void> setActiveSkin(String userId, String skinId) async {
     try {
       await _db.collection('users').doc(userId).update({
-        'currentSkin': skinId,
+        'current_skin': skinId,
       });
     } catch (e) {
       debugPrint('Error setActiveSkin: \$e');

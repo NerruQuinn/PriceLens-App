@@ -591,22 +591,87 @@ class _PriceResultScreenState extends ConsumerState<PriceResultScreen> {
   }
 
   Widget _buildHeaderImage() {
-    final imageUrl = _fetchedImageUrl ?? _resultData?['image_url'];
-    if (imageUrl != null && imageUrl.toString().startsWith('http')) {
-      return CachedNetworkImage(
-        imageUrl: imageUrl,
-        fit: BoxFit.cover,
-      );
-    } else if (imageBytes != null) {
-      return Image.memory(
-        imageBytes!,
-        fit: BoxFit.cover,
-      );
-    } else {
-      return Container(
-        color: Colors.grey[200],
-        child: const Icon(Icons.image, size: 64, color: Colors.grey),
-      );
+    if (_fetchedImageUrl != null) {
+      return CachedNetworkImage(imageUrl: _fetchedImageUrl!, fit: BoxFit.cover);
     }
+    if (imageBytes != null) {
+      return Image.memory(imageBytes!, fit: BoxFit.cover);
+    }
+    
+    final category = _resultData?['product']?['category']?.toString().toLowerCase() ?? '';
+    final productName = _resultData?['product']?['name'] ?? 'Produk';
+    
+    // Tentukan warna dan icon berdasarkan kategori
+    Color primaryColor;
+    Color secondaryColor;
+    IconData icon;
+    
+    if (category.contains('makanan') || category.contains('mie') || category.contains('snack')) {
+      primaryColor = const Color(0xFFFF6B35);
+      secondaryColor = const Color(0xFFFF8C42);
+      icon = Icons.restaurant;
+    } else if (category.contains('minuman') || category.contains('drink')) {
+      primaryColor = const Color(0xFF0096C7);
+      secondaryColor = const Color(0xFF48CAE4);
+      icon = Icons.local_drink;
+    } else if (category.contains('elektronik')) {
+      primaryColor = const Color(0xFF6B48FF);
+      secondaryColor = const Color(0xFF9B59B6);
+      icon = Icons.devices;
+    } else if (category.contains('skincare') || category.contains('beauty')) {
+      primaryColor = const Color(0xFFFF69B4);
+      secondaryColor = const Color(0xFFFFB6C1);
+      icon = Icons.face_retouching_natural;
+    } else if (category.contains('sembako') || category.contains('grocery')) {
+      primaryColor = const Color(0xFF2ECC71);
+      secondaryColor = const Color(0xFF27AE60);
+      icon = Icons.shopping_basket;
+    } else {
+      primaryColor = const Color(0xFF4285F4);
+      secondaryColor = const Color(0xFF1565C0);
+      icon = Icons.inventory_2;
+    }
+    
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [primaryColor, secondaryColor],
+        ),
+      ),
+      child: Stack(
+        children: [
+          Positioned(
+            right: -30,
+            top: -30,
+            child: Icon(icon, size: 200, color: Colors.white.withValues(alpha: 0.1)),
+          ),
+          Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon, size: 80, color: Colors.white),
+                const SizedBox(height: 12),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Text(
+                    productName,
+                    textAlign: TextAlign.center,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }

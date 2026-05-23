@@ -60,8 +60,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   List<Map<String, dynamic>> _promos = [];
   List<Map<String, dynamic>> _popular = [];
   List<Map<String, dynamic>> _community = [];
-  Map<String, String> _promoImages = {};
-  Map<String, String> _trendingImages = {};
+  final Map<String, String> _promoImages = {};
+  final Map<String, String> _trendingImages = {};
 
   @override
   void initState() {
@@ -511,10 +511,20 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       children: [
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            Text(
-              'Promo Sekarang',
-              style: tt.titleSmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Perkiraan Harga',
+                  style: tt.titleSmall?.copyWith(fontWeight: FontWeight.w600, color: Colors.black87),
+                ),
+                const Text(
+                  'Harga dapat berbeda tergantung lokasi & waktu',
+                  style: TextStyle(fontSize: 11, color: Colors.grey),
+                ),
+              ],
             ),
             TextButton(
               onPressed: () => context.go('/explore'),
@@ -958,9 +968,7 @@ class _PromoCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final name = promo['name']?.toString() ?? '';
     final store = promo['store']?.toString() ?? '';
-    final discount = promo['discount']?.toString() ?? '';
     final discountPrice = (promo['discountPrice'] as num?)?.toDouble() ?? 0.0;
-    final originalPrice = (promo['originalPrice'] as num?)?.toDouble() ?? 0.0;
     final color = Color((promo['color'] as num?)?.toInt() ?? 0xFFFFF9C4);
     return GestureDetector(
       onTap: () {
@@ -1002,26 +1010,7 @@ class _PromoCard extends StatelessWidget {
                             child: Icon(Icons.local_offer, size: 48, color: Colors.black26),
                           ),
                   ),
-                  if (discount.isNotEmpty)
-                    Positioned(
-                      top: 8,
-                      left: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFD32F2F),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: Text(
-                          discount,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                    ),
+                  // Removed discount badge
                 ],
               ),
             ),
@@ -1053,14 +1042,7 @@ class _PromoCard extends StatelessWidget {
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                    Text(
-                      _rp(originalPrice),
-                      style: const TextStyle(
-                        decoration: TextDecoration.lineThrough,
-                        color: Colors.black38,
-                        fontSize: 10,
-                      ),
-                    ),
+
                   ],
                 ),
               ),
